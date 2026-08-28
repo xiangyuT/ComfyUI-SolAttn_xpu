@@ -1,8 +1,8 @@
-"""Intel XPU Sol-Attn backend loaded from an AOT SYCL sidecar.
+"""Intel XPU Sol-Attn adapter for the packaged ``omni_xpu_kernel`` backend.
 
-The sidecar is deliberately independent of Triton.  Build it once with
-``scripts/build_xpu.py``; importing the custom node remains cheap and loading
-the DSO is deferred until the backend is queried or called.
+The custom node owns ComfyUI dispatch and diagnostics only.  The AOT
+SYCL-TLA/CUTE implementation and its build lifecycle live in
+``omni_xpu_kernel``; importing this module remains Triton-free.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ _LOAD_LOCK = threading.Lock()
 _LOADED = False
 _LOAD_ERROR = None
 _BACKEND = None
+_OMNI_CUTE = None
 _LOADED_LIBRARY = None
 _LOADED_LIBRARY_SHA256 = None
 _ROUTE_CAPTURE_LOCK = threading.Lock()
@@ -41,18 +42,6 @@ def _enabled(name):
     return os.environ.get(name, "0") not in ("0", "", "false", "False")
 
 
-def _library_candidates():
-    root = Path(__file__).resolve().parent
-    if _enabled("SOL_ATTN_XPU_REFERENCE"):
-        return [("reference", root / "_sol_attn_xpu_reference.so")]
-    if not _enabled("SOL_ATTN_XPU_EXPERIMENTAL"):
-        return []
-    override = os.environ.get("SOL_ATTN_XPU_LIBRARY")
-    if override:
-        return [("cute", Path(override).expanduser())]
-    return [("cute", root / "_sol_attn_xpu_cute.so")]
-
-
 def _sha256(path):
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -62,42 +51,50 @@ def _sha256(path):
 
 
 def _load_library():
-    global _LOADED, _LOAD_ERROR, _BACKEND
+    global _LOADED, _LOAD_ERROR, _BACKEND, _OMNI_CUTE
     global _LOADED_LIBRARY, _LOADED_LIBRARY_SHA256
     if _LOADED:
         return
     with _LOAD_LOCK:
         if _LOADED:
             return
-        candidates = [item for item in _library_candidates() if item[1].is_file()]
-        if not candidates:
-            raise RuntimeError(
-                "Sol-Attn XPU is experimental and disabled by default. Build "
-                "the CUTE sidecar with scripts/build_xpu.py, then start "
-                "ComfyUI with SOL_ATTN_XPU_EXPERIMENTAL=1. The slow reference "
-                "is opt-in via SOL_ATTN_XPU_REFERENCE=1."
-            )
-        backend, library = candidates[-1]
         try:
-            torch.ops.load_library(str(library))
+            if not _enabled("SOL_ATTN_XPU_EXPERIMENTAL"):
+                raise RuntimeError(
+                    "Sol-Attn XPU is experimental and disabled by default; "
+                    "start ComfyUI with SOL_ATTN_XPU_EXPERIMENTAL=1"
+                )
+            from omni_xpu_kernel import cute as omni_cute
+
+            if not omni_cute.supports_sol_attn():
+                raise RuntimeError(
+                    "the installed omni_xpu_kernel build does not expose "
+                    "the BMG Sol-Attn capability"
+                )
+            library_raw = omni_cute._find_so()
+            library = Path(library_raw).resolve() if library_raw else None
+            if library is None or not library.is_file():
+                raise RuntimeError(
+                    "omni_xpu_kernel loaded Sol-Attn but its CUTE DSO could "
+                    "not be identified"
+                )
         except Exception as exc:
             _LOAD_ERROR = exc
             raise RuntimeError(
-                f"failed to load Sol-Attn XPU sidecar {library}: {exc}"
+                f"failed to load packaged Sol-Attn XPU backend: {exc}"
             ) from exc
         _LOADED = True
-        _BACKEND = backend
-        _LOADED_LIBRARY = library.resolve()
+        _BACKEND = "omni-cute"
+        _OMNI_CUTE = omni_cute
+        _LOADED_LIBRARY = library
         _LOADED_LIBRARY_SHA256 = _sha256(_LOADED_LIBRARY)
         _LOAD_ERROR = None
 
 
 def backend_available():
-    """Whether an explicitly enabled, loadable AOT sidecar is available."""
+    """Whether an enabled packaged AOT Sol-Attn backend is available."""
     if _LOADED:
         return True
-    if not any(path.is_file() for _, path in _library_candidates()):
-        return False
     try:
         _load_library()
     except Exception:
@@ -602,10 +599,10 @@ def _capture_prepared_routes(
 ) -> int:
     if len(prepared) != 5:
         raise RuntimeError(
-            "route capture requires an inline-route sidecar with five prepare outputs"
+            "route capture requires a packaged backend with five prepare outputs"
         )
     k_centroids, _, q_centroids, thresholds, key_sinks = prepared
-    routes = torch.ops.sol_attn_xpu.materialize_routes(
+    routes = torch.ops.omni_xpu_sol_attn.materialize_routes(
         k_centroids, q_centroids, thresholds, key_sinks, float(scale)
     )
     return _capture_route_record(
@@ -635,9 +632,9 @@ def capture_routes(
     if not route_capture_enabled():
         raise RuntimeError("route capture was not explicitly enabled")
     _load_library()
-    if _BACKEND != "cute":
-        raise RuntimeError("route capture requires the CUTE XPU sidecar")
-    prepared = torch.ops.sol_attn_xpu.prepare(
+    if _BACKEND != "omni-cute":
+        raise RuntimeError("route capture requires packaged CUTE Sol-Attn")
+    prepared = torch.ops.omni_xpu_sol_attn.prepare(
         q,
         k,
         v,
@@ -669,7 +666,7 @@ def _record_attribution_call(
     global _ATTRIBUTION_INDEX
     _, destination, _ = _attribution_paths()
     if _LOADED_LIBRARY is None or _LOADED_LIBRARY_SHA256 is None:
-        raise RuntimeError("attribution cannot identify the loaded XPU sidecar")
+        raise RuntimeError("attribution cannot identify the packaged XPU DSO")
     destination.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "schema_version": 1,
@@ -731,13 +728,17 @@ def sol_attn(
         int(sink_q[0]),
         int(sink_q[1]),
     )
-    if _BACKEND == "reference":
-        return torch.ops.sol_attn_xpu.forward(*args)
-    prepared = torch.ops.sol_attn_xpu.prepare(*args)
     if not attribution_enabled():
-        return torch.ops.sol_attn_xpu.forward_cute(
-            q, k, v, *prepared, scale
+        return _OMNI_CUTE.sol_attn(
+            q,
+            k,
+            v,
+            scale=scale,
+            tau=float(tau),
+            sink_blocks=sink_blocks,
+            sink_q=sink_q,
         )
+    prepared = torch.ops.omni_xpu_sol_attn.prepare(*args)
 
     route_path, _, _ = _attribution_paths()
     capture_index = _capture_prepared_routes(
@@ -754,7 +755,7 @@ def sol_attn(
     itt_library = _attribution_itt_library()
     _itt_command(itt_library, "resume")
     try:
-        output = torch.ops.sol_attn_xpu.forward_cute(
+        output = torch.ops.omni_xpu_sol_attn.forward_cute(
             q, k, v, *prepared, scale
         )
         torch.xpu.synchronize()
@@ -781,12 +782,13 @@ def _sol_attn_parent_op(
     sink_q: tuple[int, int] = (0, 0),
 ) -> torch.Tensor:
     _load_library()
-    if _BACKEND != "cute" or not hasattr(torch.ops.sol_attn_xpu, op_name):
+    ops = torch.ops.omni_xpu_sol_attn
+    if _BACKEND != "omni-cute" or not hasattr(ops, op_name):
         raise RuntimeError(
-            f"the loaded candidate DSO has no {op_name} correctness op"
+            f"the packaged candidate DSO has no {op_name} correctness op"
         )
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
-    prepared = torch.ops.sol_attn_xpu.prepare(
+    prepared = ops.prepare(
         q,
         k,
         v,
@@ -797,7 +799,7 @@ def _sol_attn_parent_op(
         int(sink_q[0]),
         int(sink_q[1]),
     )
-    return getattr(torch.ops.sol_attn_xpu, op_name)(q, k, v, *prepared, scale)
+    return getattr(ops, op_name)(q, k, v, *prepared, scale)
 
 
 def sol_attn_parent(
@@ -850,8 +852,8 @@ def sol_attn_real_correctness_parent(
             int(sink_q[1]),
         )
         return output, "candidate_vs_independent_sycl_reference"
-    if _BACKEND == "cute" and hasattr(
-        torch.ops.sol_attn_xpu, "forward_cute_serial_route_parent"
+    if _BACKEND == "omni-cute" and hasattr(
+        torch.ops.omni_xpu_sol_attn, "forward_cute_serial_route_parent"
     ):
         output = _sol_attn_parent_op(
             "forward_cute_serial_route_parent",

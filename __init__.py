@@ -228,8 +228,9 @@ def _ineligible(q, k, mask, dim_head, min_tokens):
             return f"XPU backend import failed: {_XPU_IMPORT_ERROR}"
         if not _xpu_backend_available():
             return (
-                "XPU backend is disabled or not built "
-                "(set SOL_ATTN_XPU_EXPERIMENTAL=1 after building the sidecar)"
+                "XPU backend is disabled or unavailable "
+                "(install a BMG omni_xpu_kernel build with Sol-Attn and set "
+                "SOL_ATTN_XPU_EXPERIMENTAL=1)"
             )
     else:
         return f"unsupported device {q.device.type}"
@@ -674,8 +675,9 @@ class SolAttnPatch(io.ComfyNode):
         xpu_ready = _xpu_sol_attn_kernel is not None and _xpu_backend_available()
         if not (cuda_ready or xpu_ready):
             raise RuntimeError(
-                "Sol-Attn has no usable backend. For Intel XPU run "
-                "scripts/build_xpu.py and set SOL_ATTN_XPU_EXPERIMENTAL=1; "
+                "Sol-Attn has no usable backend. For Intel XPU install a "
+                "BMG omni_xpu_kernel build with Sol-Attn and set "
+                "SOL_ATTN_XPU_EXPERIMENTAL=1; "
                 "CUDA import error: "
                 f"{_CUDA_IMPORT_ERROR}; XPU import error: {_XPU_IMPORT_ERROR}"
             )

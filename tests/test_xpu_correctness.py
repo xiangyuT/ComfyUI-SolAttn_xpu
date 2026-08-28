@@ -11,7 +11,9 @@ import pytest
 import torch
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(
+    os.environ.get("SOL_ATTN_TEST_ROOT", Path(__file__).resolve().parents[1])
+).resolve()
 os.environ.setdefault("SOL_ATTN_XPU_EXPERIMENTAL", "1")
 
 
@@ -135,7 +137,7 @@ def test_xpu_matches_algorithm_reference(tokens, heads, tau, sink_blocks, sink_q
     torch.xpu.synchronize()
     torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
     has_serial_route_parent = hasattr(
-        torch.ops.sol_attn_xpu, "forward_cute_serial_route_parent"
+        torch.ops.omni_xpu_sol_attn, "forward_cute_serial_route_parent"
     )
     if os.environ.get("SOL_ATTN_XPU_REQUIRE_SERIAL_ROUTE_PARENT") == "1":
         assert has_serial_route_parent

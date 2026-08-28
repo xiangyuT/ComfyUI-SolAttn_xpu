@@ -16,7 +16,8 @@
 
 [Sol-Attn](https://arxiv.org/abs/2607.24027) is a training-free sparse attention
 method for accelerating image and video generation. This community extension
-integrates a Triton implementation of Sol-Attn into ComfyUI.
+integrates CUDA Triton and packaged Intel XPU implementations of Sol-Attn into
+ComfyUI.
 
 > [!NOTE]
 > This project is a work in progress. It has currently been tested on RTX 4090
@@ -31,31 +32,27 @@ speed.
 
 ## Intel XPU
 
-The XPU backend does not import or depend on Triton. It is built as an AOT SYCL
-sidecar and submitted on the current PyTorch XPU stream. CUDA Triton sources are
-kept unchanged for upstream maintenance.
+The XPU path does not import or depend on Triton. Kernel ownership, compilation,
+and packaging live in `omni_xpu_kernel`; this custom node only supplies ComfyUI
+dispatch and configuration. CUDA Triton sources remain unchanged for upstream
+maintenance.
 
 Current XPU scope is intentionally narrow: BF16, self-attention without a mask,
 head dimension 128, and Q/K/V with a contiguous last dimension. This includes
 MiniMax H3's interleaved QKV views without materializing them. INT8 QK/PV and
-TMA are CUDA-only; on XPU the node logs once and uses the BF16 SYCL path.
+TMA are CUDA-only; on XPU the node logs once and uses the packaged BF16
+SYCL-TLA/CUTE path.
 
-Build the sidecar with the same Python environment that runs ComfyUI and a
-SYCL-TLA checkout:
+Install a BMG build of `omni_xpu_kernel` that exports Sol-Attn in the same
+Python environment as ComfyUI. Verify the capability before starting ComfyUI:
 
-```bash
-cd ComfyUI/custom_nodes/ComfyUI-SolAttn_xpu
-python scripts/build_xpu.py --target bmg --sycl-tla-root /path/to/sycl-tla
+```python
+from omni_xpu_kernel import cute
+assert cute.supports_sol_attn()
 ```
 
-The build requires an XPU PyTorch wheel, Intel `icpx`, and the Intel SYCL-TLA
-sources used by the CUTE/DPAS mainloop. `CUTLASS_SYCL_ROOT` can be used instead
-of `--sycl-tla-root`. Use `--target ptl-h` for a PTL-H build; BMG is the initial
-development and validation target.
-
-The CUTE/DPAS backend is still behind an explicit experimental gate while its
-performance and workflow-quality acceptance work is incomplete. Restart
-ComfyUI with the gate enabled after building:
+The XPU backend remains behind an explicit experimental gate. Restart ComfyUI
+with the gate enabled after installing the package:
 
 ```bash
 SOL_ATTN_XPU_EXPERIMENTAL=1 python main.py
@@ -70,11 +67,9 @@ and start with `start_percent=0.2`, `end_percent=0.9`, `min_tokens=4096`.
 diagnostics, but it does not replace the XPU experimental gate. The per-model
 patch node is preferred.
 
-The repository also has a slow regular-SYCL correctness reference, built with
-`--backend reference` and selected with `SOL_ATTN_XPU_REFERENCE=1`. It is for
-diagnostics only. The CUTE/DPAS implementation is not yet a claimed performance
-replacement for the maintained dense XPU attention route; canonical workflow
-E2E and package/image validation remain acceptance gates.
+The custom node intentionally contains no XPU C++ source or local build script;
+the installed package is the single runtime implementation. Unsupported tensor
+contracts fall back to the existing dense attention route.
 
 ## Examples
 

@@ -1,2 +1,4 @@
 .claude
 *.pyc
+_sol_attn_xpu*.so
+build/

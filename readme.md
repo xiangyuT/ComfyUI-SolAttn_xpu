@@ -1,7 +1,7 @@
 <h1 align="center">ComfyUI-SolAttn</h1>
 
 <h4 align="center">
-  Experimental Triton implementation of Sol-Attn for ComfyUI
+  Experimental CUDA Triton and Intel XPU SYCL implementation of Sol-Attn for ComfyUI
 </h4>
 
 <p align="center">
@@ -28,6 +28,53 @@ Triton kernels are compiled on first use, so the first run will be slower.
 
 Use `start_percent`, `end_percent`, and `tau` to balance generation quality and
 speed.
+
+## Intel XPU
+
+The XPU backend does not import or depend on Triton. It is built as an AOT SYCL
+sidecar and submitted on the current PyTorch XPU stream. CUDA Triton sources are
+kept unchanged for upstream maintenance.
+
+Current XPU scope is intentionally narrow: BF16, self-attention without a mask,
+head dimension 128, and Q/K/V with a contiguous last dimension. This includes
+MiniMax H3's interleaved QKV views without materializing them. INT8 QK/PV and
+TMA are CUDA-only; on XPU the node logs once and uses the BF16 SYCL path.
+
+Build the sidecar with the same Python environment that runs ComfyUI and a
+SYCL-TLA checkout:
+
+```bash
+cd ComfyUI/custom_nodes/ComfyUI-SolAttn_xpu
+python scripts/build_xpu.py --target bmg --sycl-tla-root /path/to/sycl-tla
+```
+
+The build requires an XPU PyTorch wheel, Intel `icpx`, and the Intel SYCL-TLA
+sources used by the CUTE/DPAS mainloop. `CUTLASS_SYCL_ROOT` can be used instead
+of `--sycl-tla-root`. Use `--target ptl-h` for a PTL-H build; BMG is the initial
+development and validation target.
+
+The CUTE/DPAS backend is still behind an explicit experimental gate while its
+performance and workflow-quality acceptance work is incomplete. Restart
+ComfyUI with the gate enabled after building:
+
+```bash
+SOL_ATTN_XPU_EXPERIMENTAL=1 python main.py
+```
+
+To enable the node in a workflow, place **Patch Sol-Attn** after the model loader
+and connect its model output to the sampler. For the first XPU tests, set
+`int8_qk=false`, leave `use_tma=false`, keep the canonical H3 workflow unchanged,
+and start with `start_percent=0.2`, `end_percent=0.9`, `min_tokens=4096`.
+
+`SOL_ATTN=1` still enables the global attention override for command-line
+diagnostics, but it does not replace the XPU experimental gate. The per-model
+patch node is preferred.
+
+The repository also has a slow regular-SYCL correctness reference, built with
+`--backend reference` and selected with `SOL_ATTN_XPU_REFERENCE=1`. It is for
+diagnostics only. The CUTE/DPAS implementation is not yet a claimed performance
+replacement for the maintained dense XPU attention route; canonical workflow
+E2E and package/image validation remain acceptance gates.
 
 ## Examples
 

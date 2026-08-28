@@ -20,28 +20,73 @@ from comfy.ldm.modules.attention import (
 from comfy.patcher_extension import CallbacksMP
 from comfy_api.latest import ComfyExtension, io
 
-from ._autotune_log import set_verbose as _set_autotune_verbose
+def _set_autotune_verbose(_enabled):
+    """No-op on backends that do not import Triton."""
+
+
+_cuda_sol_attn_kernel = None
+_cuda_sol_attn_int8_kernel = None
+_cuda_has_tma = None
+_CUDA_IMPORT_ERROR = None
+_CUDA_INT8_IMPORT_ERROR = None
+
+# Do not import Triton in an XPU-only process.  Intel XPU environments should
+# be able to load the custom node with no Triton package installed at all.
+if torch.cuda.is_available():
+    try:
+        from ._autotune_log import set_verbose as _set_autotune_verbose
+        from ._tri_fwd import sol_attn as _cuda_sol_attn_kernel, _has_tma as _cuda_has_tma
+    except Exception as exc:  # Triton / torch version issues
+        _CUDA_IMPORT_ERROR = exc
+
+    try:
+        from ._int8_fwd import sol_attn_int8 as _cuda_sol_attn_int8_kernel
+    except Exception as exc:
+        _CUDA_INT8_IMPORT_ERROR = exc
 
 try:
-    from ._tri_fwd import sol_attn as _sol_attn_kernel, _has_tma
-    _IMPORT_ERROR = None
-except Exception as exc:  # triton / torch version issues
-    _sol_attn_kernel = None
-    _has_tma = None
-    _IMPORT_ERROR = exc
-
-try:
-    from ._int8_fwd import sol_attn_int8 as _sol_attn_int8_kernel
-    _INT8_IMPORT_ERROR = None
+    from ._xpu_fwd import (
+        attribution_enabled as _xpu_attribution_enabled,
+        backend_available as _xpu_backend_available,
+        capture_routes as _xpu_capture_routes,
+        real_correctness_configured as _xpu_real_correctness_configured,
+        real_correctness_pending as _xpu_real_correctness_pending,
+        record_real_correctness as _xpu_record_real_correctness,
+        reset_real_correctness as _xpu_reset_real_correctness,
+        reset_attribution as _xpu_reset_attribution,
+        reset_route_capture as _xpu_reset_route_capture,
+        route_capture_enabled as _xpu_route_capture_enabled,
+        sol_attn as _xpu_sol_attn_kernel,
+        sol_attn_real_correctness_parent as _xpu_real_correctness_parent,
+    )
+    _XPU_IMPORT_ERROR = None
 except Exception as exc:
-    _sol_attn_int8_kernel = None
-    _INT8_IMPORT_ERROR = exc
+    _xpu_sol_attn_kernel = None
+    _xpu_real_correctness_parent = None
+    _XPU_IMPORT_ERROR = exc
+
+    def _xpu_backend_available():
+        return False
+
+    def _xpu_route_capture_enabled():
+        return False
+
+    def _xpu_attribution_enabled():
+        return False
+
+    def _xpu_real_correctness_configured():
+        return False
+
+    def _xpu_real_correctness_pending():
+        return False
 
 
 HEAD_DIM = 128
 
-_stats = {"sparse": 0, "dense_fallback": 0, "outside_range": 0,
-          "dense_block": 0, "errors": 0}
+_stats = {"sparse": 0, "route_capture": 0, "attribution": 0,
+          "real_correctness": 0,
+          "dense_fallback": 0, "outside_range": 0, "dense_block": 0,
+          "errors": 0}
 _seen = set()
 _BLOCK_INDEX_HOOKED = set()
 
@@ -150,6 +195,12 @@ def reset_sol_attn_stats():
     for key in _stats:
         _stats[key] = 0
     _seen.clear()
+    if _xpu_route_capture_enabled():
+        _xpu_reset_route_capture()
+    if _xpu_attribution_enabled():
+        _xpu_reset_attribution()
+    if _xpu_real_correctness_configured():
+        _xpu_reset_real_correctness()
 
 
 def _log_once(key, message):
@@ -169,10 +220,19 @@ def _log_kernel_failure(exc):
 
 def _ineligible(q, k, mask, dim_head, min_tokens):
     """Why this call can't use Sol-Attn, or None if it can. q/k are BTHD."""
-    if _sol_attn_kernel is None:
-        return f"kernel import failed: {_IMPORT_ERROR}"
-    if q.device.type != "cuda":
-        return "not cuda"
+    if q.device.type == "cuda":
+        if _cuda_sol_attn_kernel is None:
+            return f"CUDA kernel import failed: {_CUDA_IMPORT_ERROR}"
+    elif q.device.type == "xpu":
+        if _xpu_sol_attn_kernel is None:
+            return f"XPU backend import failed: {_XPU_IMPORT_ERROR}"
+        if not _xpu_backend_available():
+            return (
+                "XPU backend is disabled or not built "
+                "(set SOL_ATTN_XPU_EXPERIMENTAL=1 after building the sidecar)"
+            )
+    else:
+        return f"unsupported device {q.device.type}"
     if q.dtype != torch.bfloat16:
         return f"dtype {q.dtype} (kernel is bf16-only)"
     if dim_head != HEAD_DIM:
@@ -191,7 +251,8 @@ def _ineligible(q, k, mask, dim_head, min_tokens):
 
 def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
          tau, min_tokens, verbose, int8_qk=False, sink_blocks=(0, 0),
-         sink_q=(0, 0), use_tma=False, int8_pv=True):
+         sink_q=(0, 0), use_tma=False, int8_pv=True,
+         capture_context=None):
     """Returns the attention output, or None if this call should stay dense."""
     if skip_reshape:
         b, _, _, dim_head = q.shape          # BHND
@@ -210,19 +271,54 @@ def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
 
     # No contiguous() here: the kernels take strides, so H3's interleaved qkv
     # views go in without copies.
-    extra = {"int8_pv": int8_pv} if int8_qk else {}
-    kernel = _sol_attn_int8_kernel if int8_qk else _sol_attn_kernel
+    is_cuda = qs.device.type == "cuda"
+    use_int8 = bool(int8_qk and is_cuda)
+    if int8_qk and not is_cuda:
+        _log_once(
+            ("xpu", "int8-unavailable"),
+            "XPU INT8 exact branch is not implemented; using the BF16 SYCL backend",
+        )
+    extra = {"int8_pv": int8_pv} if use_int8 else {}
+    if is_cuda:
+        kernel = _cuda_sol_attn_int8_kernel if use_int8 else _cuda_sol_attn_kernel
+    else:
+        kernel = _xpu_sol_attn_kernel
+        extra["capture_context"] = capture_context
+    if not is_cuda and _xpu_route_capture_enabled():
+        effective_scale = qs.shape[-1] ** -0.5 if scale is None else float(scale)
+        _xpu_capture_routes(
+            qs,
+            ks,
+            vs,
+            scale=effective_scale,
+            tau=tau,
+            sink_blocks=sink_blocks,
+            sink_q=sink_q,
+            context=capture_context,
+        )
+        _stats["route_capture"] += 1
+        if verbose:
+            _log_once(
+                (tuple(qs.shape), "route-capture"),
+                f"capturing exact routes for {tuple(qs.shape)} and returning dense",
+            )
+        return None
     out = kernel(
         qs, ks, vs,
         scale=scale, tau=tau, sink_blocks=sink_blocks, sink_q=sink_q,
         use_tma=use_tma, **extra,
     )  # BTHD
     _stats["sparse"] += 1
+    if not is_cuda and _xpu_attribution_enabled():
+        _stats["attribution"] += 1
     if verbose:
-        mode = "int8" if int8_qk else "bf16"
+        mode = "int8" if use_int8 else "bf16"
         # The kernels also require SM90+ and a Triton with TensorDescriptor, so
         # report the path actually taken rather than what was asked for.
-        path = "tma" if (use_tma and _has_tma(qs.device)) else "pointer"
+        if is_cuda:
+            path = "tma" if (use_tma and _cuda_has_tma(qs.device)) else "pointer"
+        else:
+            path = "xpu-cute"
         _log_once((tuple(qs.shape), "sparse", mode, path),
                   f"sparse {tuple(qs.shape)} tau={tau} {mode} {path}")
 
@@ -281,8 +377,16 @@ def make_override(tau=1.0, min_tokens=4096,
         # Depth gates, the counterpart of the sigma window below. Sensitivity to
         # sparsification varies several-fold across depth, so a block can be kept
         # dense outright or given its own tau.
+        capture_active = _xpu_route_capture_enabled()
+        attribution_active = (
+            q.device.type == "xpu" and _xpu_attribution_enabled()
+        )
+        real_correctness = (
+            q.device.type == "xpu" and _xpu_real_correctness_configured()
+        )
         block = None
-        if dense_blocks or tau_profile:
+        if (dense_blocks or tau_profile or capture_active
+                or attribution_active or real_correctness):
             block = kwargs.get("transformer_options", {}).get("sol_block")
         if block in dense_blocks:
             _stats["dense_block"] += 1
@@ -290,6 +394,7 @@ def make_override(tau=1.0, min_tokens=4096,
         block_tau = tau_profile.get(block, tau) if tau_profile else tau
 
         # Sampling-percentage gate, so the paper's dense warm-up steps work.
+        sigma = None
         if sigma_start is not None or sigma_end is not None:
             sigmas = kwargs.get("transformer_options", {}).get("sigmas")
             if sigmas is not None:
@@ -306,16 +411,76 @@ def make_override(tau=1.0, min_tokens=4096,
             _log_once((tokens, sink, sink_q),
                       f"conditioning sink: KV blocks {sink} exact, dense query blocks {sink_q}")
 
+        # This diagnostic runs at most the configured number of sparse calls,
+        # compares them with the original dense operator, and returns dense for
+        # every call. Later blocks therefore see the unchanged dense trajectory.
+        if real_correctness and not _xpu_real_correctness_pending():
+            return dense()
+
         try:
             out = _run(q, k, v, heads, skip_reshape, skip_output_reshape,
                        kwargs.get("scale", None), block_tau,
                        min_tokens, verbose, int8_qk, sink, sink_q, use_tma,
-                       int8_pv)
+                       int8_pv, {"block": block, "sigma": sigma})
         except Exception as exc:
             _stats["errors"] += 1
             _log_kernel_failure(exc)
+            if capture_active or attribution_active or real_correctness:
+                raise
             return dense()
-        return dense() if out is None else out
+        if out is None:
+            return dense()
+        if real_correctness:
+            q_bthd = (
+                q.transpose(1, 2)
+                if skip_reshape
+                else q.view(q.shape[0], q.shape[1], heads, q.shape[-1] // heads)
+            )
+            if skip_reshape:
+                k_bthd, v_bthd = (
+                    tensor.transpose(1, 2) for tensor in (k, v)
+                )
+            else:
+                k_bthd, v_bthd = (
+                    tensor.view(
+                        tensor.shape[0], tensor.shape[1], heads,
+                        tensor.shape[-1] // heads,
+                    )
+                    for tensor in (k, v)
+                )
+            parent_bthd, comparison = _xpu_real_correctness_parent(
+                q_bthd,
+                k_bthd,
+                v_bthd,
+                scale=kwargs.get("scale", None),
+                tau=block_tau,
+                sink_blocks=sink,
+                sink_q=sink_q,
+            )
+            reference = (
+                parent_bthd.transpose(1, 2)
+                if skip_output_reshape
+                else parent_bthd.reshape(
+                    q_bthd.shape[0], q_bthd.shape[1], -1
+                )
+            )
+            recorded = _xpu_record_real_correctness(
+                out,
+                reference,
+                q_bthd,
+                context={
+                    "block": block,
+                    "sigma": sigma,
+                    "comparison": comparison,
+                },
+            )
+            if not recorded:
+                raise RuntimeError(
+                    "real-activation correctness call was not recorded"
+                )
+            _stats["real_correctness"] += 1
+            return dense()
+        return out
 
     return override
 
@@ -358,7 +523,7 @@ def _compose_module_patch(module, patched_forward):
         x = args[0] if args else None
         # KJNodes' low-VRAM block patch hands x over in a single-item list.
         tensor = x[0] if isinstance(x, list) and len(x) == 1 and torch.is_tensor(x[0]) else x
-        take = gate is not None and torch.is_tensor(tensor) and tensor.device.type == "cuda" \
+        take = gate is not None and torch.is_tensor(tensor) and tensor.device.type in ("cuda", "xpu") \
             and tensor.dtype == torch.bfloat16 and tensor.ndim in (2, 3)
         if take:
             # H3 packs tokens first (s, dim); Wan/LTX2 are batch-first.
@@ -505,10 +670,19 @@ class SolAttnPatch(io.ComfyNode):
                 min_tokens, int8_qk, sink_conditioning, morton,
                 morton_curve, dense_blocks, verbose,
                 tau_profile=None, use_tma=False, int8_pv=True) -> io.NodeOutput:
-        if _sol_attn_kernel is None:
-            raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
-        if int8_qk and _sol_attn_int8_kernel is None:
-            raise RuntimeError(f"Sol-Attn INT8 kernel unavailable: {_INT8_IMPORT_ERROR}")
+        cuda_ready = _cuda_sol_attn_kernel is not None
+        xpu_ready = _xpu_sol_attn_kernel is not None and _xpu_backend_available()
+        if not (cuda_ready or xpu_ready):
+            raise RuntimeError(
+                "Sol-Attn has no usable backend. For Intel XPU run "
+                "scripts/build_xpu.py and set SOL_ATTN_XPU_EXPERIMENTAL=1; "
+                "CUDA import error: "
+                f"{_CUDA_IMPORT_ERROR}; XPU import error: {_XPU_IMPORT_ERROR}"
+            )
+        if int8_qk and cuda_ready and not xpu_ready and _cuda_sol_attn_int8_kernel is None:
+            raise RuntimeError(
+                f"Sol-Attn CUDA INT8 kernel unavailable: {_CUDA_INT8_IMPORT_ERROR}"
+            )
 
         diffusion_model = model.get_model_object("diffusion_model")
         is_h3 = hasattr(diffusion_model, "rope_freqs") and hasattr(diffusion_model, "_forward")
@@ -537,11 +711,28 @@ class SolAttnPatch(io.ComfyNode):
         count = len(blocks) if blocks is not None else 0
         dense = parse_blocks(dense_blocks, count)
         profile = parse_tau_profile(tau_profile or "", count)
-        if (dense or profile) and not _install_block_index(diffusion_model):
+        capture_active = _xpu_route_capture_enabled()
+        attribution_active = _xpu_attribution_enabled()
+        real_correctness = _xpu_real_correctness_configured()
+        if (dense or profile or capture_active or attribution_active
+                or real_correctness) and not _install_block_index(diffusion_model):
             logging.warning(
-                f"[sol_attn] dense_blocks/tau_profile ignored: "
+                f"[sol_attn] block-indexed option/capture ignored: "
                 f"{type(diffusion_model).__name__} has no .blocks list to index")
-            dense, profile = frozenset(), {}
+            if dense or profile:
+                dense, profile = frozenset(), {}
+            if capture_active:
+                raise RuntimeError(
+                    "Sol-Attn route capture requires a transformer .blocks list"
+                )
+            if attribution_active:
+                raise RuntimeError(
+                    "Sol-Attn attribution requires a transformer .blocks list"
+                )
+            if real_correctness:
+                raise RuntimeError(
+                    "Sol-Attn real correctness requires a transformer .blocks list"
+                )
         if dense:
             logging.info(f"[sol_attn] keeping blocks {sorted(dense)} dense of {count}")
         if profile:
@@ -666,8 +857,11 @@ def attention_sol(q, k, v, heads, mask=None, attn_precision=None,
 register_attention_function("sol_attn", attention_sol)
 
 if os.environ.get("SOL_ATTN", "0") not in ("0", "", "false"):
-    if _sol_attn_kernel is None:
-        logging.error(f"[sol_attn] SOL_ATTN set but kernel import failed: {_IMPORT_ERROR}")
+    if _cuda_sol_attn_kernel is None and not _xpu_backend_available():
+        logging.error(
+            "[sol_attn] SOL_ATTN set but no backend is available; "
+            f"CUDA error: {_CUDA_IMPORT_ERROR}; XPU error: {_XPU_IMPORT_ERROR}"
+        )
     else:
         import comfy.ldm.modules.attention as _attn_mod
 

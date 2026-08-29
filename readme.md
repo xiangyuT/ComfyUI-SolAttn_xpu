@@ -1,7 +1,7 @@
 <h1 align="center">ComfyUI-SolAttn</h1>
 
 <h4 align="center">
-  Experimental Triton implementation of Sol-Attn for ComfyUI
+  Experimental CUDA Triton and Intel XPU SYCL implementation of Sol-Attn for ComfyUI
 </h4>
 
 <p align="center">
@@ -16,7 +16,8 @@
 
 [Sol-Attn](https://arxiv.org/abs/2607.24027) is a training-free sparse attention
 method for accelerating image and video generation. This community extension
-integrates a Triton implementation of Sol-Attn into ComfyUI.
+integrates CUDA Triton and packaged Intel XPU implementations of Sol-Attn into
+ComfyUI.
 
 > [!NOTE]
 > This project is a work in progress. It has currently been tested on RTX 4090
@@ -28,6 +29,47 @@ Triton kernels are compiled on first use, so the first run will be slower.
 
 Use `start_percent`, `end_percent`, and `tau` to balance generation quality and
 speed.
+
+## Intel XPU
+
+The XPU path does not import or depend on Triton. Kernel ownership, compilation,
+and packaging live in `omni_xpu_kernel`; this custom node only supplies ComfyUI
+dispatch and configuration. CUDA Triton sources remain unchanged for upstream
+maintenance.
+
+Current XPU scope is intentionally narrow: BF16, self-attention without a mask,
+head dimension 128, and Q/K/V with a contiguous last dimension. This includes
+MiniMax H3's interleaved QKV views without materializing them. INT8 QK/PV and
+TMA are CUDA-only; on XPU the node logs once and uses the packaged BF16
+SYCL-TLA/CUTE path.
+
+Install a BMG build of `omni_xpu_kernel` that exports Sol-Attn in the same
+Python environment as ComfyUI. Verify the capability before starting ComfyUI:
+
+```python
+from omni_xpu_kernel import cute
+assert cute.supports_sol_attn()
+```
+
+The XPU backend remains behind an explicit experimental gate. Restart ComfyUI
+with the gate enabled after installing the package:
+
+```bash
+SOL_ATTN_XPU_EXPERIMENTAL=1 python main.py
+```
+
+To enable the node in a workflow, place **Patch Sol-Attn** after the model loader
+and connect its model output to the sampler. For the first XPU tests, set
+`int8_qk=false`, leave `use_tma=false`, keep the canonical H3 workflow unchanged,
+and start with `start_percent=0.2`, `end_percent=0.9`, `min_tokens=4096`.
+
+`SOL_ATTN=1` still enables the global attention override for command-line
+diagnostics, but it does not replace the XPU experimental gate. The per-model
+patch node is preferred.
+
+The custom node intentionally contains no XPU C++ source or local build script;
+the installed package is the single runtime implementation. Unsupported tensor
+contracts fall back to the existing dense attention route.
 
 ## Examples
 
